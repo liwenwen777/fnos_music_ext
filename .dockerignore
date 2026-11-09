@@ -10,6 +10,8 @@
 proxy/*
 !proxy/__init__.py
 !proxy/env_merge.py
+# webui 的 /api/charts 优先读 proxy/charts.py，缺失会静默回落到内置榜单
+!proxy/charts.py
 **/__pycache__/
 **/*.pyc
 **/.pytest_cache/

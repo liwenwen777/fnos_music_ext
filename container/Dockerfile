@@ -95,7 +95,9 @@ COPY --chown=appuser:appuser lxmusic-service/js/bridge.js /srv/lxmusic-service/j
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
 # webui 复用 .env 安全合并（sys.path 上加 /srv 后 import proxy.env_merge），必须随镜像分发
-COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py /srv/proxy/
+# charts.py 同理：webui 的 /api/charts 优先用它里的榜单定义，缺文件时 except 静默回落到
+# 内置的 KG/WY 两套榜单——不挂源码的纯镜像场景会少榜单且无任何报错。
+COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py proxy/charts.py /srv/proxy/
 RUN find /srv -name "*.py" -exec chmod 0644 {} + \
     && chmod 0755 /srv/lxmusic-service/js/bridge.js \
     && mkdir -p /repo \
