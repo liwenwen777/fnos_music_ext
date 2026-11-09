@@ -1,0 +1,121 @@
+# 预构建 fnmusic-sources 镜像并推送到 GHCR。
+#
+# 存在的理由：release.yml 只发 .fpk，install.sh 每次升级都执行
+# `docker compose up -d --build`，等于在用户 NAS 上现场跑 apt(nodejs/ffmpeg/supervisor)
+# 与 4 份 pip 依赖。Dockerfile 里那套 DNS 自愈 + 双源回退，本身就是"现场构建太痛"的症状。
+#
+# 有了本 workflow，安装路径可以退化为 `docker compose pull`：
+#   - 安装/升级从 5~15 分钟降到拉取级
+#   - 构建期的不确定性（apt/pip/DNS）集中到 CI 一台机器
+#   - 用户拿到的依赖永远是 CI 验证过的那一套
+#
+# 使用方式（install.sh 侧的可选改造，本文件不强制）：
+#   FNMUSIC_IMAGE_SOURCE=pull   # pull 失败再回落 --build
+#   FNMUSIC_IMAGE_SOURCE=build  # 保持现状，本地构建
+name: Image
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "构建平台（逗号分隔）"
+        required: false
+        default: "linux/amd64"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          ver="$(tr -d ' \r\n' < VERSION)"
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag_ok=$([ "${GITHUB_REF_NAME}" = "v${ver}" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_ok=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve image tags
+        id: meta
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY}/fnmusic-sources"
+          tags="${repo}:${VERSION}
+          ${repo}:sha-${GITHUB_SHA}"
+          # latest 只跟随 tag 发布；main 上的提交只出 sha/版本 tag，
+          # 避免未发布代码被用户当成稳定版拉走。
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            test "${GITHUB_REF_NAME}" = "v${VERSION}"
+            tags="${tags}
+          ${repo}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "${tags}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: container/Dockerfile
+          # 官方源构建：CI 在公网，无需国内镜像；apt 镜像参数留空走 deb.debian.org
+          build-args: |
+            BASE_IMAGE=python:3.13-slim
+            PIP_INDEX_URL=https://pypi.org/simple
+            APT_MIRROR=
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 与 ci.yml 的 images job 同款契约：镜像可起、healthz 能通
+      - name: Smoke test pushed image
+        run: |
+          img="ghcr.io/${GITHUB_REPOSITORY}/fnmusic-sources:${VERSION}"
+          docker pull "$img"
+          mkdir -p /tmp/fnrepo
+          printf '%s\n' 'FNMUSIC_MUSICDL_ENABLED=true' 'FNMUSIC_WEBUI_ENABLED=false' > /tmp/fnrepo/.env
+          name="fnmusic-image-smoke"
+          trap 'docker logs "$name"; docker rm -f "$name"' EXIT
+          docker run -d --name "$name" --network none -v /tmp/fnrepo:/repo "$img"
+          ready=0
+          for _ in $(seq 1 40); do
+            if docker exec "$name" python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8001/healthz", timeout=2)'; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
