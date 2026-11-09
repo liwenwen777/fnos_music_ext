@@ -22,10 +22,11 @@ services:
         PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}
         APT_MIRROR: ${FNMUSIC_APT_MIRROR:-https://mirrors.tencent.com}
     # 默认本地构建并打此 tag。CI 已发布预构建镜像（.github/workflows/image.yml）：
-    #   docker pull ghcr.io/liwenwen777/fnmusic-sources:latest
-    #   docker tag  ghcr.io/liwenwen777/fnmusic-sources:latest fnmusic-sources:latest
+    #   docker pull ghcr.io/liwenwen777/fnos_music_ext/fnmusic-sources:<version>
+    #   docker tag  ghcr.io/liwenwen777/fnos_music_ext/fnmusic-sources:<version> fnmusic-sources:latest
     #   docker compose up -d        # 本地已有同名镜像即不再构建
-    # 不直接把 image 指向 ghcr.io：GHCR 包默认私有，直连会在未登录的 NAS 上拉取失败。
+    # install.sh 默认就走这条路（FNMUSIC_IMAGE_SOURCE=pull，失败回落 --build）。
+    # 不直接把 image 指向 ghcr.io：私有/未公开时直连会拉取失败，且本地构建场景应能离线。
     image: fnmusic-sources:latest
     container_name: fnmusic-sources
     ports:

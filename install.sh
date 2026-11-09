@@ -1108,7 +1108,8 @@ sources_quick_ready() {
 # 预构建镜像（.github/workflows/image.yml 发布到 GHCR）。
 # 命中即可跳过现场 apt(nodejs/ffmpeg/supervisor) + 4 份 pip，安装从 5~15 分钟降到拉取级；
 # 拉不到（包未公开 / 国内直连 ghcr 受限 / 离线）一律回落本地构建，行为与旧版一致。
-PREBUILT_IMAGE_REPO="${FNMUSIC_IMAGE_REPO:-ghcr.io/liwenwen777/fnmusic-sources}"
+# 注意路径是 ghcr.io/<owner>/<repo>/<image>：仓库段不能省，否则命中不到包。
+PREBUILT_IMAGE_REPO="${FNMUSIC_IMAGE_REPO:-ghcr.io/liwenwen777/fnos_music_ext/fnmusic-sources}"
 
 pull_prebuilt_sources_image() {
     local tag="${FNMUSIC_IMAGE_TAG:-${FNMUSIC_VERSION}}"
