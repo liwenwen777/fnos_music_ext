@@ -1,0 +1,13 @@
+# 仓库内一律 LF：本项目在 Linux（fnOS/容器）里执行，CRLF 会让脚本在
+# 运行时出现 `$'{\r'` 这类难以定位的语法错误（bash -n 却可能通过）。
+# Windows 检出由 git 的 eol 转换处理，不影响本地编辑体验。
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Windows 侧脚本保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
