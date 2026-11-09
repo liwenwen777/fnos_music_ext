@@ -43,3 +43,20 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
+    # 资源与日志上限：容器内跑野生洛雪脚本 + ffmpeg + 抓取日志，默认 json-file
+    # 无上限，异常脚本刷日志会把 NAS 系统盘写满（表现为「NAS 突然只读」）。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # 常驻 100-200MB；1g 留给 ffmpeg 转码/无损校验的瞬态峰值。
+    mem_limit: 1g
+    memswap_limit: 1g
+    # 防止脚本 fork 风暴拖垮宿主机调度。
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    # 容器内只跑 python/node/supervisor，不需要任何 Linux capability。
+    cap_drop:
+      - ALL
