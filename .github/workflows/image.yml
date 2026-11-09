@@ -134,15 +134,14 @@ jobs:
 
       - name: Extract pull helper from install.sh
         run: |
-          start=$(grep -n '^pull_prebuilt_sources_image() {' install.sh | cut -d: -f1)
-          if [ -z "${start}" ]; then
+          # 直接用区间匹配，不拼行号变量（awk 取结束行在不同 shell 下行为不一致）
+          sed -n '/^pull_prebuilt_sources_image() {/,/^}$/p' install.sh > /tmp/fn_pull.sh
+          if ! grep -q '^pull_prebuilt_sources_image() {' /tmp/fn_pull.sh; then
             echo "未在 install.sh 中找到 pull_prebuilt_sources_image()"
             exit 1
           fi
-          end=$(awk -v s="${start}" 'NR > s && /^}$/ { print NR; exit }' install.sh)
-          sed -n "${start},${end}p" install.sh > /tmp/fn_pull.sh
-          echo "--- 抽出的函数（前 3 行）---"
-          head -3 /tmp/fn_pull.sh
+          echo "--- 抽出的函数：$(wc -l < /tmp/fn_pull.sh) 行，前 2 行 ---"
+          head -2 /tmp/fn_pull.sh
 
       - name: Pull image the way install.sh does
         env:
