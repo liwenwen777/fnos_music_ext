@@ -119,3 +119,43 @@ jobs:
           test "$ready" = 1
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+
+  # 回归保护：直接复用 install.sh 里的 pull_prebuilt_sources_image，
+  # 验证「镜像路径 -> 探活 -> 拉取 -> 打本地 tag」整条链路真的能通。
+  # 这里最容易出错的是路径（ghcr.io/<owner>/<repo>/<image> 少写 repo 段），
+  # 而它只影响安装体验、不影响镜像构建，普通 CI 看不出来。
+  verify-pull:
+    needs: build
+    # 拉 1GB 镜像较慢，只在发布/手动时验证，避免每次 main 推送都跑
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract pull helper from install.sh
+        run: |
+          start=$(grep -n '^pull_prebuilt_sources_image() {' install.sh | cut -d: -f1)
+          if [ -z "${start}" ]; then
+            echo "未在 install.sh 中找到 pull_prebuilt_sources_image()"
+            exit 1
+          fi
+          end=$(awk -v s="${start}" 'NR > s && /^}$/ { print NR; exit }' install.sh)
+          sed -n "${start},${end}p" install.sh > /tmp/fn_pull.sh
+          echo "--- 抽出的函数（前 3 行）---"
+          head -3 /tmp/fn_pull.sh
+
+      - name: Pull image the way install.sh does
+        env:
+          FNMUSIC_LOCAL_IMAGE: fnmusic-scratch:verify
+        run: |
+          set -euo pipefail
+          log_info() { echo "[INFO] $*"; }
+          log_warn() { echo "[WARN] $*"; }
+          run_docker() { docker "$@"; }
+          FNMUSIC_VERSION="$(tr -d ' \r\n' < VERSION)"
+          PREBUILT_IMAGE_REPO="ghcr.io/${GITHUB_REPOSITORY}/fnmusic-sources"
+          # shellcheck disable=SC1091
+          . /tmp/fn_pull.sh
+          pull_prebuilt_sources_image
+          docker image inspect "${FNMUSIC_LOCAL_IMAGE}" >/dev/null
+          echo "OK: 预构建镜像拉取并打 tag 成功"
