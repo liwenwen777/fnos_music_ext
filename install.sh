@@ -1114,10 +1114,28 @@ PREBUILT_IMAGE_REPO="${FNMUSIC_IMAGE_REPO:-ghcr.io/liwenwen777/fnos_music_ext/fn
 pull_prebuilt_sources_image() {
     local tag="${FNMUSIC_IMAGE_TAG:-${FNMUSIC_VERSION}}"
     local ref="${PREBUILT_IMAGE_REPO}:${tag}"
-    local secs="${FNMUSIC_PULL_TIMEOUT:-300}"
-    log_info "尝试拉取预构建镜像 ${ref}（上限 ${secs}s）..."
-    # timeout 约束整条拉取链路：直连 ghcr 可能长时间卡在 TLS handshake，
-    # 不设上限会让安装看起来"卡死"。任何失败都返回非 0，由调用方回落构建。
+    local probe="${FNMUSIC_PROBE_TIMEOUT:-45}"
+    local secs="${FNMUSIC_PULL_TIMEOUT:-600}"
+
+    # 一阶段：manifest inspect 做秒级探活（镜像是否存在/公开、线路是否通）。
+    # 先探再拉，避免"1GB 下到 99% 被超时杀掉"这种最差体验——那种情况下
+    # 用户等了几分钟，最后还得回落到更慢的本地构建。
+    log_info "检查预构建镜像 ${ref} ..."
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${probe}" sh -c '
+            if docker info >/dev/null 2>&1; then docker manifest inspect "$1" >/dev/null
+            elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then sudo docker manifest inspect "$1" >/dev/null
+            else exit 1; fi
+        ' sh "${ref}" >/dev/null 2>&1 || return 1
+    else
+        run_docker manifest inspect "${ref}" >/dev/null 2>&1 || return 1
+    fi
+
+    # 二阶段：探活通过才真拉。
+    # 上限刻意保守（默认 600s）：国内直连 ghcr 常见「某一层 Retrying 5 次后失败」，
+    # 那种情况给再多时间也拉不完，只会让安装白等；超时/失败一律回落本地构建。
+    # 线路快但带宽小的机器可调大 FNMUSIC_PULL_TIMEOUT。
+    log_info "开始拉取 ${ref}（上限 ${secs}s，超时改走本地构建）..."
     if command -v timeout >/dev/null 2>&1; then
         timeout "${secs}" sh -c '
             if docker info >/dev/null 2>&1; then docker pull "$1"
@@ -1127,8 +1145,9 @@ pull_prebuilt_sources_image() {
     else
         run_docker pull "${ref}" || return 1
     fi
-    # compose 的 image 固定为本地 tag：打好同名 tag 后 up -d 不会再触发构建
-    run_docker tag "${ref}" fnmusic-sources:latest || return 1
+    # compose 的 image 固定为本地 tag：打好同名 tag 后 up -d 不会再触发构建。
+    # FNMUSIC_LOCAL_IMAGE 可覆盖（compose 里改过镜像名时用，也便于测试时不碰运行中的镜像）。
+    run_docker tag "${ref}" "${FNMUSIC_LOCAL_IMAGE:-fnmusic-sources:latest}" || return 1
     return 0
 }
 
