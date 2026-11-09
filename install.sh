@@ -1105,6 +1105,32 @@ sources_quick_ready() {
     return 0
 }
 
+# 预构建镜像（.github/workflows/image.yml 发布到 GHCR）。
+# 命中即可跳过现场 apt(nodejs/ffmpeg/supervisor) + 4 份 pip，安装从 5~15 分钟降到拉取级；
+# 拉不到（包未公开 / 国内直连 ghcr 受限 / 离线）一律回落本地构建，行为与旧版一致。
+PREBUILT_IMAGE_REPO="${FNMUSIC_IMAGE_REPO:-ghcr.io/liwenwen777/fnmusic-sources}"
+
+pull_prebuilt_sources_image() {
+    local tag="${FNMUSIC_IMAGE_TAG:-${FNMUSIC_VERSION}}"
+    local ref="${PREBUILT_IMAGE_REPO}:${tag}"
+    local secs="${FNMUSIC_PULL_TIMEOUT:-300}"
+    log_info "尝试拉取预构建镜像 ${ref}（上限 ${secs}s）..."
+    # timeout 约束整条拉取链路：直连 ghcr 可能长时间卡在 TLS handshake，
+    # 不设上限会让安装看起来"卡死"。任何失败都返回非 0，由调用方回落构建。
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${secs}" sh -c '
+            if docker info >/dev/null 2>&1; then docker pull "$1"
+            elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then sudo docker pull "$1"
+            else exit 1; fi
+        ' sh "${ref}" || return 1
+    else
+        run_docker pull "${ref}" || return 1
+    fi
+    # compose 的 image 固定为本地 tag：打好同名 tag 后 up -d 不会再触发构建
+    run_docker tag "${ref}" fnmusic-sources:latest || return 1
+    return 0
+}
+
 install_sources_container() {
     log_info "构建并启动单容器 ${CONTAINER_NAME}（所选音源 + WebUI 按需启动）..."
     cleanup_legacy_sources
@@ -1115,7 +1141,27 @@ install_sources_container() {
     fi
     # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
     export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
+    local use_prebuilt=0
+    case "${FNMUSIC_IMAGE_SOURCE:-pull}" in
+        build)
+            log_info "FNMUSIC_IMAGE_SOURCE=build：跳过拉取，直接本地构建镜像"
+            ;;
+        *)
+            if pull_prebuilt_sources_image; then
+                use_prebuilt=1
+            else
+                log_warn "预构建镜像不可用（未公开 / 网络受限 / 离线），回落本地构建（首次约 5~15 分钟）"
+            fi
+            ;;
+    esac
+    if [ "${use_prebuilt}" -eq 1 ]; then
+        log_info "使用预构建镜像启动容器（无需现场安装 apt/pip 依赖）"
+        if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d; then
+            log_err "预构建镜像启动失败（compose up -d）。"
+            log_err "可改 FNMUSIC_IMAGE_SOURCE=build 重试，或检查 /var/log/apps/fnmusic-ext-install.log。"
+            return 1
+        fi
+    elif ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
         log_err "Docker 镜像构建或启动失败（compose up --build）。"
         log_err "若日志里反复出现 apt/pip 拉取超时：多为国内网络直连境外源受限，"
         log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"

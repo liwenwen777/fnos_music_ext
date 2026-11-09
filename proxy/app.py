@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -3271,6 +3272,15 @@ async def lifespan(fastapi_app: FastAPI):
         fastapi_app.state.llm_client = httpx.AsyncClient(timeout=dailyrec.LLM_TIMEOUT_S)
         created_llm = True
 
+    # 封面 CDN 共享客户端：keep-alive 复用 TLS 会话，避免每张封面重新握手。
+    global _COVER_HTTP
+    if _COVER_HTTP is None:
+        _COVER_HTTP = httpx.AsyncClient(
+            timeout=8.0,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+        )
+
     try:
         yield
     finally:
@@ -3307,6 +3317,9 @@ async def lifespan(fastapi_app: FastAPI):
         if created_llm and getattr(fastapi_app.state, "llm_client", None):
             await fastapi_app.state.llm_client.aclose()
             fastapi_app.state.llm_client = None
+        if _COVER_HTTP is not None:
+            await _COVER_HTTP.aclose()
+            _COVER_HTTP = None
 
 
 app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
@@ -6233,6 +6246,10 @@ async def track_metadata(request: Request, subpath: str = ""):
 # 在线曲目封面永不 404（空封面是客户端裂图的主要来源）。 ===
 _COVER_CDN_CACHE: dict[str, tuple[str, float]] = {}
 _COVER_CDN_TTL_S = 7 * 86400.0
+# 封面/封面补全共用长连接客户端：封面是最高频路径（一次列表渲染几十张），
+# 每张都新建 AsyncClient 会重复 TCP+TLS 握手（酷狗/网易 CDN 上 100-300ms），
+# 既慢又容易被对方判定为异常流量。由 lifespan 创建与关闭；测试/独立调用时回退临时客户端。
+_COVER_HTTP: "httpx.AsyncClient | None" = None
 _KW_TEXT_COVER_HOST = dailyrec.KW_TEXT_COVER_HOST
 _PLACEHOLDER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "covers")
 _PLACEHOLDER_COUNT = 6
@@ -6243,6 +6260,31 @@ _TINY_GRAY_PNG = (
     b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
     b"\xf0\x1f\x00\x05\x05\x02\x00_\xc8\xe7A\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+
+
+class _CoverClient:
+    """共享封面客户端的外壳：`async with` 不关闭共享实例，无共享实例时退化为一次性客户端。
+
+    独立调用（脚本/测试/未走 lifespan 的场景）行为与改造前一致：临时客户端用完即关。
+    """
+
+    def __init__(self) -> None:
+        self._temp: "httpx.AsyncClient | None" = None
+
+    async def __aenter__(self) -> httpx.AsyncClient:
+        if _COVER_HTTP is not None:
+            return _COVER_HTTP
+        self._temp = httpx.AsyncClient(timeout=8.0, follow_redirects=True)
+        return self._temp
+
+    async def __aexit__(self, *_exc: object) -> None:
+        if self._temp is not None:
+            await self._temp.aclose()
+            self._temp = None
+
+
+def _cover_http_client() -> _CoverClient:
+    return _CoverClient()
 
 
 def _cover_cache_get(key: str) -> str:
@@ -6340,7 +6382,7 @@ async def _enrich_cover_via_netease(
 
     # 1. 优先尝试直接请求网易云官方 CloudSearch API（免登录、直连、速度快、元数据全）
     try:
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+        async with _cover_http_client() as client:
             r = await client.get(
                 "https://music.163.com/api/cloudsearch/pc",
                 params={"s": keyword, "type": "1", "limit": "3", "offset": "0"},
@@ -6348,6 +6390,7 @@ async def _enrich_cover_via_netease(
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     "Referer": "https://music.163.com",
                 },
+                timeout=5.0,
             )
             if r.status_code == 200:
                 res = r.json()
@@ -6450,7 +6493,9 @@ def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
     return None
 
 
-_COVER_BYTES_CACHE: dict[str, tuple[bytes, str, float]] = {}
+# LRU：专辑/歌单页会反复请求同一批封面，用插入序淘汰会把热门封面挤掉（原实现为 FIFO），
+# 命中即 move_to_end，让真正热的那 500 张常驻。
+_COVER_BYTES_CACHE: "OrderedDict[str, tuple[bytes, str, float]]" = OrderedDict()
 _COVER_BYTES_MAX_ITEMS = 500
 _COVER_BYTES_TTL_S = 86400 * 7  # 7 days
 
@@ -6466,7 +6511,10 @@ async def fetch_cover_image_bytes(url: str) -> "tuple[bytes, str] | None":
     now = time.time()
     hit = _COVER_BYTES_CACHE.get(url)
     if hit and now - hit[2] < _COVER_BYTES_TTL_S:
+        _COVER_BYTES_CACHE.move_to_end(url)
         return hit[0], hit[1]
+    if hit:
+        _COVER_BYTES_CACHE.pop(url, None)
 
     try:
         ref = "https://www.kugou.com"
@@ -6477,7 +6525,7 @@ async def fetch_cover_image_bytes(url: str) -> "tuple[bytes, str] | None":
         elif "kuwo.cn" in url:
             ref = "https://www.kuwo.cn"
 
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        async with _cover_http_client() as client:
             r = await client.get(
                 url,
                 headers={
@@ -6493,10 +6541,8 @@ async def fetch_cover_image_bytes(url: str) -> "tuple[bytes, str] | None":
         mime = _sniff_image_mime(data) or r.headers.get("content-type", "image/jpeg").split(";")[0]
         if not mime or not mime.startswith("image/"):
             mime = "image/jpeg"
-        if len(_COVER_BYTES_CACHE) > _COVER_BYTES_MAX_ITEMS:
-            keys = list(_COVER_BYTES_CACHE.keys())[: _COVER_BYTES_MAX_ITEMS // 5]
-            for k in keys:
-                _COVER_BYTES_CACHE.pop(k, None)
+        while len(_COVER_BYTES_CACHE) >= _COVER_BYTES_MAX_ITEMS:
+            _COVER_BYTES_CACHE.popitem(last=False)  # 淘汰最久未命中
         _COVER_BYTES_CACHE[url] = (data, mime, now)
         return data, mime
     except Exception as e:
@@ -9244,6 +9290,8 @@ def _trace_forwarded_endpoint(request: Request) -> None:
     path = request.url.path
     if not path.startswith("/music/api/"):
         return
+    if len(_FORWARDED_PATH_STATS) > 4096:  # 官方端点数量有限，超限即异常，兜底防涨
+        _FORWARDED_PATH_STATS.clear()
     count = _FORWARDED_PATH_STATS.get(path, 0) + 1
     _FORWARDED_PATH_STATS[path] = count
     if CONF.get("trace_forward") or count == 1 or count % 50 == 0:
